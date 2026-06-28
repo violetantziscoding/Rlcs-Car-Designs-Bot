@@ -5,7 +5,8 @@ import json
 import os
 import aiohttp
 from bs4 import BeautifulSoup
-import asyncio
+import hashlib
+import re
 
 # ================= CONFIG =================
 
@@ -22,7 +23,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {"last_tweet": "", "enabled": True}
+        return {"enabled": True, "seen": []}
     return json.load(open(STATE_FILE, "r"))
 
 def save_state():
@@ -31,9 +32,36 @@ def save_state():
 
 state = load_state()
 
-# ================= TWITTER RSS =================
+# ================= NORMALISATION =================
 
-def fetch_latest_tweet():
+def normalize(text):
+    text = text.lower().strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+def fingerprint(tweet):
+    base = f"{tweet.get('id','')}|{tweet.get('link','')}|{normalize(tweet.get('text',''))}"
+    return hashlib.sha256(base.encode()).hexdigest()
+
+# ================= ANTI DOUBLON =================
+
+def is_duplicate(tweet):
+    fp = fingerprint(tweet)
+
+    if fp in state["seen"]:
+        return True
+
+    state["seen"].append(fp)
+
+    if len(state["seen"]) > 100:
+        state["seen"] = state["seen"][-100:]
+
+    save_state()
+    return False
+
+# ================= TWITTER FETCH =================
+
+def fetch_latest():
     urls = [
         f"https://nitter.net/{USER}/rss",
         f"https://nitter.poast.org/{USER}/rss"
@@ -67,13 +95,11 @@ async def get_images(url):
         soup = BeautifulSoup(html, "html.parser")
 
         images = []
-
-        # OpenGraph first
         for meta in soup.find_all("meta"):
             if meta.get("property") in ["og:image", "og:image:secure_url"]:
                 images.append(meta.get("content"))
 
-        return list(dict.fromkeys(images))  # remove duplicates
+        return list(dict.fromkeys(images))
 
     except:
         return []
@@ -82,6 +108,7 @@ async def get_images(url):
 
 @tasks.loop(seconds=60)
 async def twitter_loop():
+
     if not state["enabled"]:
         return
 
@@ -89,15 +116,12 @@ async def twitter_loop():
     if not channel:
         return
 
-    tweet = fetch_latest_tweet()
+    tweet = fetch_latest()
     if not tweet:
         return
 
-    if tweet["id"] == state["last_tweet"]:
+    if is_duplicate(tweet):
         return
-
-    state["last_tweet"] = tweet["id"]
-    save_state()
 
     images = await get_images(tweet["link"])
 
@@ -134,14 +158,14 @@ async def toggle(interaction: discord.Interaction):
 @admin.command(name="status")
 async def status(interaction: discord.Interaction):
     await interaction.response.send_message(
-        f"Enabled: {state['enabled']}\nLast tweet: {state['last_tweet']}"
+        f"Enabled: {state['enabled']}\nSeen: {len(state['seen'])}"
     )
 
 @admin.command(name="force")
 async def force(interaction: discord.Interaction):
-    state["last_tweet"] = ""
+    state["seen"] = []
     save_state()
-    await interaction.response.send_message("Reset OK")
+    await interaction.response.send_message("Cache reset OK")
 
 bot.tree.add_command(admin)
 
